@@ -1,9 +1,9 @@
 """
-Search manager for semantic search, query processing, and result retrieval.
+Search manager for semantic search, query processing, and result retrieval using File Search tool.
 """
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from typing import List, Optional, Dict, Any
-import time
 
 from src.file_search_client import FileSearchClient
 from src.response_handler import ResponseHandler, SearchResponse
@@ -11,7 +11,7 @@ from config.settings import settings
 from config.prompts import PromptTemplates
 
 class SearchManager:
-    """Manages search operations and query processing with Google AI files."""
+    """Manages search operations using Google AI File Search tool."""
 
     def __init__(self, client: FileSearchClient, model_name: Optional[str] = None):
         """
@@ -25,129 +25,63 @@ class SearchManager:
         self.model_name = model_name or settings.default_model
         self.response_handler = ResponseHandler()
 
-        # Configure the generative AI client
-        genai.configure(api_key=self.client.api_key)
-
-        # Performance optimization: Cache file objects to avoid repeated API calls
-        self._file_cache: Dict[str, Any] = {}
-        self._cache_ttl = 3600  # Cache files for 1 hour
-        self._cache_timestamps: Dict[str, float] = {}
-
-    def _get_file_cached(self, file_name: str) -> Any:
-        """
-        Get file object with caching to avoid repeated API calls.
-
-        Args:
-            file_name: Name of the file to retrieve
-
-        Returns:
-            File object from cache or API
-        """
-        current_time = time.time()
-
-        # Check if file is in cache and not expired
-        if file_name in self._file_cache:
-            cache_age = current_time - self._cache_timestamps.get(file_name, 0)
-            if cache_age < self._cache_ttl:
-                return self._file_cache[file_name]
-
-        # Fetch from API and cache
-        file_obj = genai.get_file(file_name)
-        self._file_cache[file_name] = file_obj
-        self._cache_timestamps[file_name] = current_time
-        return file_obj
-
-    def clear_cache(self):
-        """Clear the file object cache."""
-        self._file_cache.clear()
-        self._cache_timestamps.clear()
-        print("✅ File cache cleared")
-
     def search_and_generate(
         self,
         query: str,
         store_name: str,
         system_prompt: Optional[str] = None,
-        temperature: float = 0.1,
-        max_tokens: Optional[int] = 2048,  # OPTIMIZATION: More aggressive limit for speed
-        max_files: Optional[int] = 5  # OPTIMIZATION: Default to 5 files for faster responses
+        temperature: float = 0.0,
+        max_tokens: Optional[int] = 1024
     ) -> SearchResponse:
         """
-        Perform semantic search and generate response using uploaded files.
+        Perform semantic search and generate response using File Search tool.
 
         Args:
             query: User query
-            store_name: File store to search
+            store_name: File Search store name (resource ID)
             system_prompt: Optional system prompt override
             temperature: Generation temperature (0.0-1.0)
-            max_tokens: Maximum tokens in response (default 8192)
-            max_files: Maximum number of files to include (default: all)
+            max_tokens: Maximum tokens in response
 
         Returns:
             SearchResponse with answer and citations
         """
         try:
-            # Get files from the store
-            file_names = self.client.get_files_for_generation(store_name)
-            if not file_names:
+            # Resolve store name if needed
+            resolved_store = self.client.get_store_by_name(store_name)
+            if not resolved_store:
                 return SearchResponse(
-                    answer=f"No files found in store '{store_name}'. Please upload some documents first.",
+                    answer=f"Store '{store_name}' not found. Please create one first using 'create-store' command.",
                     citations=[],
                     model_used=self.model_name,
                     query=query
                 )
-
-            # OPTIMIZATION: Limit number of files with smart selection
-            if max_files and len(file_names) > max_files:
-                print(f"⚡ Limiting to {max_files} files (out of {len(file_names)}) for faster response")
-                
-                # Get file sizes and prioritize smaller files for speed
-                try:
-                    file_info_list = self.client.list_files_in_store(store_name)
-                    file_size_map = {f['name']: f['size_bytes'] for f in file_info_list}
-                    
-                    # Sort files by size (smaller first for faster processing)
-                    file_names_with_sizes = [(name, file_size_map.get(name, 0)) for name in file_names]
-                    file_names_with_sizes.sort(key=lambda x: x[1])  # Sort by size
-                    
-                    # Take the smallest files up to max_files
-                    file_names = [name for name, size in file_names_with_sizes[:max_files]]
-                    
-                    total_size_mb = sum(size for _, size in file_names_with_sizes[:max_files]) / (1024 * 1024)
-                    print(f"   Selected files total size: {total_size_mb:.1f} MB")
-                    
-                except Exception as e:
-                    print(f"   Warning: Could not optimize file selection: {e}")
-                    file_names = file_names[:max_files]
             
             # Prepare the prompt
             formatted_query = PromptTemplates.format_search_prompt(query)
             
-            print(f"🔍 Searching {len(file_names)} files in store '{store_name}' for: {query[:100]}...")
+            print(f"🔍 Searching in store '{store_name}' for: {query[:100]}...")
             
-            # Create model instance
-            generation_config = genai.GenerationConfig(
+            # Build the generation config with File Search tool
+            gen_config = types.GenerateContentConfig(
                 temperature=temperature,
-                max_output_tokens=max_tokens
+                max_output_tokens=max_tokens,
+                system_instruction=system_prompt or PromptTemplates.RAG_SYSTEM_PROMPT,
+                tools=[
+                    types.Tool(
+                        file_search=types.FileSearch(
+                            file_search_store_names=[resolved_store]
+                        )
+                    )
+                ]
             )
             
-            model = genai.GenerativeModel(
-                model_name=self.model_name,
-                generation_config=generation_config,
-                system_instruction=system_prompt or PromptTemplates.RAG_SYSTEM_PROMPT
+            # Generate response with File Search grounding
+            response = self.client.get_client().models.generate_content(
+                model=self.model_name,
+                contents=formatted_query,
+                config=gen_config
             )
-            
-            # Prepare content with files (using cache for performance)
-            content = [formatted_query]
-            for file_name in file_names:
-                try:
-                    file_obj = self._get_file_cached(file_name)
-                    content.append(file_obj)
-                except Exception as e:
-                    print(f"⚠️  Could not access file {file_name}: {e}")
-            
-            # Generate response with file context
-            response = model.generate_content(content)
             
             # Process the response
             search_response = self.response_handler.process_response(
@@ -156,7 +90,7 @@ class SearchManager:
                 model_name=self.model_name
             )
             
-            print(f"✅ Generated response from {len(file_names)} files")
+            print(f"✅ Generated response with File Search grounding")
             return search_response
             
         except Exception as e:
@@ -177,7 +111,7 @@ class SearchManager:
         temperature: float = 0.1
     ) -> SearchResponse:
         """
-        Search across multiple file stores.
+        Search across multiple File Search stores.
         
         Args:
             query: User query
@@ -189,15 +123,18 @@ class SearchManager:
             SearchResponse combining results from all stores
         """
         try:
-            # Collect files from all stores
-            all_files = []
+            # Resolve all store names
+            resolved_stores = []
             for store_name in store_names:
-                files = self.client.get_files_for_generation(store_name)
-                all_files.extend(files)
+                resolved = self.client.get_store_by_name(store_name)
+                if resolved:
+                    resolved_stores.append(resolved)
+                else:
+                    print(f"⚠️  Store '{store_name}' not found, skipping")
             
-            if not all_files:
+            if not resolved_stores:
                 return SearchResponse(
-                    answer=f"No files found in stores: {', '.join(store_names)}",
+                    answer=f"No valid stores found in: {', '.join(store_names)}",
                     citations=[],
                     model_used=self.model_name,
                     query=query
@@ -205,24 +142,26 @@ class SearchManager:
             
             formatted_query = PromptTemplates.format_search_prompt(query)
             
-            print(f"🔍 Searching across {len(store_names)} stores ({len(all_files)} files) for: {query[:100]}...")
+            print(f"🔍 Searching across {len(resolved_stores)} stores for: {query[:100]}...")
             
-            # Create model and generate response
-            model = genai.GenerativeModel(
-                model_name=self.model_name,
-                generation_config=genai.GenerationConfig(temperature=temperature),
-                system_instruction=system_prompt or PromptTemplates.RAG_SYSTEM_PROMPT
+            # Build config with multiple stores
+            gen_config = types.GenerateContentConfig(
+                temperature=temperature,
+                system_instruction=system_prompt or PromptTemplates.RAG_SYSTEM_PROMPT,
+                tools=[
+                    types.Tool(
+                        file_search=types.FileSearch(
+                            file_search_store_names=resolved_stores
+                        )
+                    )
+                ]
             )
             
-            content = [formatted_query]
-            for file_name in all_files:
-                try:
-                    file_obj = self._get_file_cached(file_name)
-                    content.append(file_obj)
-                except Exception as e:
-                    print(f"⚠️  Could not access file {file_name}: {e}")
-            
-            response = model.generate_content(content)
+            response = self.client.get_client().models.generate_content(
+                model=self.model_name,
+                contents=formatted_query,
+                config=gen_config
+            )
             
             search_response = self.response_handler.process_response(
                 response=response,
@@ -230,7 +169,7 @@ class SearchManager:
                 model_name=self.model_name
             )
             
-            print(f"✅ Found response from {len(all_files)} files across {len(store_names)} stores")
+            print(f"✅ Found response from {len(resolved_stores)} stores")
             return search_response
             
         except Exception as e:
@@ -246,15 +185,14 @@ class SearchManager:
         self,
         question: str,
         store_name: str,
-        context: Optional[str] = None,
-        max_files: Optional[int] = 3  # OPTIMIZATION: Even fewer files for Q&A
+        context: Optional[str] = None
     ) -> SearchResponse:
         """
         Ask a specific question with optional additional context.
         
         Args:
             question: Direct question to ask
-            store_name: File store to search
+            store_name: File Search store to search
             context: Optional additional context
             
         Returns:
@@ -271,8 +209,7 @@ class SearchManager:
                 query=formatted_prompt,
                 store_name=store_name,
                 temperature=0.0,  # More deterministic for Q&A
-                max_tokens=1024,  # OPTIMIZATION: Shorter for direct Q&A
-                max_files=max_files
+                max_tokens=1024
             )
             
         except Exception as e:
@@ -287,14 +224,13 @@ class SearchManager:
     def summarize_documents(
         self,
         store_name: str,
-        focus_topic: Optional[str] = None,
-        max_files: Optional[int] = 7  # OPTIMIZATION: Most files for summaries but still limited
+        focus_topic: Optional[str] = None
     ) -> SearchResponse:
         """
         Generate a summary of documents in a store.
         
         Args:
-            store_name: File store to summarize
+            store_name: File Search store to summarize
             focus_topic: Optional topic to focus the summary on
             
         Returns:
@@ -310,8 +246,7 @@ class SearchManager:
                 query=query,
                 store_name=store_name,
                 temperature=0.3,  # Slightly more creative for summaries
-                max_tokens=3072,  # OPTIMIZATION: Reasonable summary length
-                max_files=max_files
+                max_tokens=3072
             )
             
         except Exception as e:
@@ -331,14 +266,13 @@ class SearchManager:
             Dictionary with model information
         """
         try:
-            model = genai.get_model(f"models/{self.model_name}")
+            model = self.client.get_client().models.get(name=f"models/{self.model_name}")
             return {
                 'name': model.name,
-                'display_name': model.display_name,
-                'description': model.description,
-                'input_token_limit': model.input_token_limit,
-                'output_token_limit': model.output_token_limit,
-                'supported_generation_methods': model.supported_generation_methods
+                'display_name': getattr(model, 'display_name', model.name),
+                'description': getattr(model, 'description', 'N/A'),
+                'input_token_limit': getattr(model, 'input_token_limit', 'N/A'),
+                'output_token_limit': getattr(model, 'output_token_limit', 'N/A')
             }
         except Exception as e:
             return {
@@ -358,7 +292,7 @@ class SearchManager:
         """
         try:
             # Test if model exists and is accessible
-            genai.get_model(f"models/{model_name}")
+            self.client.get_client().models.get(name=f"models/{model_name}")
             self.model_name = model_name
             print(f"✅ Switched to model: {model_name}")
             return True
@@ -377,12 +311,14 @@ class SearchManager:
         
         Args:
             queries: List of queries to process
-            store_name: File store to search
+            store_name: File Search store to search
             delay_seconds: Delay between requests
             
         Returns:
             List of SearchResponse objects
         """
+        import time
+        
         results = []
         
         for i, query in enumerate(queries, 1):

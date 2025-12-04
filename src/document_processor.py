@@ -7,6 +7,7 @@ from typing import List, Dict, Any, Optional, Tuple
 import mimetypes
 
 from src.file_search_client import FileSearchClient
+from config.settings import settings
 
 class DocumentProcessor:
     """Handles document preprocessing, validation, and upload operations."""
@@ -18,7 +19,10 @@ class DocumentProcessor:
         '.html': 'text/html',
         '.htm': 'text/html',
         '.md': 'text/markdown',
-        '.markdown': 'text/markdown'
+        '.markdown': 'text/markdown',
+        '.csv': 'text/csv',
+        '.json': 'application/json',
+        '.xml': 'application/xml'
     }
     
     def __init__(self, client: FileSearchClient):
@@ -48,8 +52,8 @@ class DocumentProcessor:
             
             # Check file size
             size_mb = path.stat().st_size / (1024 * 1024)
-            if size_mb > 100:  # Google's limit
-                return False, f"File too large: {size_mb:.1f}MB (max 100MB)"
+            if size_mb > settings.max_file_size_mb:
+                return False, f"File too large: {size_mb:.1f}MB (max {settings.max_file_size_mb}MB)"
             
             # Check if file is readable
             try:
@@ -78,89 +82,64 @@ class DocumentProcessor:
             results[file_path] = self.validate_file(file_path)
         return results
     
-    def create_metadata(
+    def get_chunking_config(
         self,
-        document_type: Optional[str] = None,
-        category: Optional[str] = None,
-        tags: Optional[List[str]] = None,
-        custom_fields: Optional[Dict[str, Any]] = None
-    ) -> List[Dict[str, Any]]:
+        max_tokens_per_chunk: Optional[int] = None,
+        max_overlap_tokens: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
         """
-        Create metadata for document upload.
+        Create chunking configuration for file upload.
         
         Args:
-            document_type: Type of document (e.g., 'manual', 'report', 'article')
-            category: Category classification
-            tags: List of tags for the document
-            custom_fields: Additional custom metadata fields
+            max_tokens_per_chunk: Maximum tokens per chunk (default from settings)
+            max_overlap_tokens: Maximum overlap tokens (default from settings)
             
         Returns:
-            List of metadata dictionaries
+            Chunking config dictionary or None if using defaults
         """
-        metadata = []
+        tokens = max_tokens_per_chunk or settings.max_tokens_per_chunk
+        overlap = max_overlap_tokens or settings.max_overlap_tokens
         
-        if document_type:
-            metadata.append({"key": "document_type", "string_value": document_type})
-        
-        if category:
-            metadata.append({"key": "category", "string_value": category})
-        
-        if tags:
-            metadata.append({"key": "tags", "string_value": ",".join(tags)})
-        
-        if custom_fields:
-            for key, value in custom_fields.items():
-                if isinstance(value, str):
-                    metadata.append({"key": key, "string_value": value})
-                elif isinstance(value, (int, float)):
-                    metadata.append({"key": key, "numeric_value": value})
-        
-        return metadata
+        return {
+            'white_space_config': {
+                'max_tokens_per_chunk': tokens,
+                'max_overlap_tokens': overlap
+            }
+        }
     
     def upload_document(
         self,
         file_path: str,
         store_name: str,
         display_name: Optional[str] = None,
-        document_type: Optional[str] = None,
-        category: Optional[str] = None,
-        tags: Optional[List[str]] = None,
-        custom_fields: Optional[Dict[str, Any]] = None
+        use_custom_chunking: bool = False
     ) -> str:
         """
-        Upload a document with preprocessing and metadata.
+        Upload a document with preprocessing.
         
         Args:
             file_path: Path to the file
-            store_name: Target File Search store
+            store_name: Target File Search store (resource ID)
             display_name: Optional display name
-            document_type: Document type classification
-            category: Document category
-            tags: List of tags
-            custom_fields: Additional metadata
+            use_custom_chunking: Whether to use custom chunking config
             
         Returns:
-            Upload operation name
+            Operation name
         """
         # Validate file first
         is_valid, error_msg = self.validate_file(file_path)
         if not is_valid:
             raise ValueError(error_msg)
         
-        # Create metadata
-        metadata = self.create_metadata(
-            document_type=document_type,
-            category=category,
-            tags=tags,
-            custom_fields=custom_fields
-        )
+        # Prepare chunking config if requested
+        chunking_config = self.get_chunking_config() if use_custom_chunking else None
         
         # Upload the document
         return self.client.upload_document(
             file_path=file_path,
             store_name=store_name,
             display_name=display_name,
-            metadata=metadata if metadata else None
+            chunking_config=chunking_config
         )
     
     def upload_directory(
@@ -168,21 +147,19 @@ class DocumentProcessor:
         directory_path: str,
         store_name: str,
         recursive: bool = True,
-        document_type: Optional[str] = None,
-        category: Optional[str] = None
+        use_custom_chunking: bool = False
     ) -> List[str]:
         """
         Upload all supported files in a directory.
         
         Args:
             directory_path: Path to the directory
-            store_name: Target File Search store
+            store_name: Target File Search store (resource ID)
             recursive: Whether to search subdirectories
-            document_type: Default document type for all files
-            category: Default category for all files
+            use_custom_chunking: Whether to use custom chunking config
             
         Returns:
-            List of upload operation names
+            List of operation names
         """
         directory = Path(directory_path)
         if not directory.exists() or not directory.is_dir():
@@ -225,8 +202,7 @@ class DocumentProcessor:
                     file_path=file_path,
                     store_name=store_name,
                     display_name=str(relative_path),
-                    document_type=document_type,
-                    category=category
+                    use_custom_chunking=use_custom_chunking
                 )
                 operation_names.append(operation_name)
                 

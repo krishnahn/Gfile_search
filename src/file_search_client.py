@@ -1,112 +1,98 @@
 """
-Core Google File Search API client wrapper.
+Core Google File Search API client wrapper using the official FileSearchStore API.
 """
-import google.generativeai as genai
-from google.generativeai import types
+from google import genai
+from google.genai import types
 from typing import List, Optional, Dict, Any
 import os
 import time
-import json
 from pathlib import Path
 
 from config.settings import settings
 
 class FileSearchClient:
-    """Wrapper class for Google AI File operations and RAG functionality."""
+    """Wrapper class for Google AI File Search operations."""
     
     def __init__(self, api_key: Optional[str] = None):
         """Initialize the client with API key."""
         self.api_key = api_key or settings.api_key
-        genai.configure(api_key=self.api_key)
-        self.stores_file = Path("data/stores.json")
-        self.uploaded_files = self._load_stores()
+        self.client = genai.Client(api_key=self.api_key)
     
-    def _load_stores(self) -> Dict[str, List[Dict]]:
-        """Load stores from persistent storage."""
-        if self.stores_file.exists():
-            try:
-                with open(self.stores_file, 'r') as f:
-                    return json.load(f)
-            except Exception as e:
-                print(f"⚠️  Could not load stores: {e}")
-        return {}
-    
-    def _save_stores(self):
-        """Save stores to persistent storage."""
-        try:
-            self.stores_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.stores_file, 'w') as f:
-                json.dump(self.uploaded_files, f, indent=2)
-        except Exception as e:
-            print(f"⚠️  Could not save stores: {e}")
-        
     def create_store(self, store_name: str) -> str:
         """
-        Create a virtual store for organizing uploaded files.
+        Create a new File Search store.
         
         Args:
             store_name: Display name for the store
             
         Returns:
-            Store name for future operations
+            Store name (resource ID) for future operations
         """
         try:
-            if store_name not in self.uploaded_files:
-                self.uploaded_files[store_name] = []
-                self._save_stores()
-            print(f"✅ Created virtual store: {store_name}")
-            return store_name
+            file_search_store = self.client.file_search_stores.create(
+                config={'display_name': store_name}
+            )
+            print(f"✅ Created File Search store: {store_name}")
+            print(f"   Store ID: {file_search_store.name}")
+            return file_search_store.name
         except Exception as e:
             print(f"❌ Error creating store '{store_name}': {e}")
             raise
     
     def list_stores(self) -> List[Dict[str, Any]]:
         """
-        List all virtual stores.
+        List all File Search stores.
         
         Returns:
             List of store information dictionaries
         """
         try:
             stores = []
-            for store_name, files in self.uploaded_files.items():
+            for store in self.client.file_search_stores.list():
                 stores.append({
-                    'name': store_name,
-                    'display_name': store_name,
-                    'file_count': len(files),
-                    'create_time': 'N/A'
+                    'name': store.name,
+                    'display_name': getattr(store, 'display_name', store.name),
+                    'create_time': getattr(store, 'create_time', 'N/A')
                 })
             return stores
         except Exception as e:
             print(f"❌ Error listing stores: {e}")
             raise
     
-    def delete_store(self, store_name: str, force: bool = True) -> bool:
+    def get_store(self, store_name: str) -> Optional[Any]:
         """
-        Delete a virtual store and its files.
+        Get a specific File Search store by name.
         
         Args:
-            store_name: Name of the store to delete
-            force: Whether to force deletion
+            store_name: Full resource name of the store
+            
+        Returns:
+            Store object or None
+        """
+        try:
+            return self.client.file_search_stores.get(name=store_name)
+        except Exception as e:
+            print(f"⚠️  Could not get store '{store_name}': {e}")
+            return None
+    
+    def delete_store(self, store_name: str, force: bool = True) -> bool:
+        """
+        Delete a File Search store.
+        
+        Args:
+            store_name: Full resource name of the store
+            force: Whether to force deletion even if store has files
             
         Returns:
             True if successful
         """
         try:
-            if store_name in self.uploaded_files:
-                # Delete all files in the store
-                for file_info in self.uploaded_files[store_name]:
-                    try:
-                        genai.delete_file(file_info['name'])
-                    except:
-                        pass  # File might already be deleted
-                del self.uploaded_files[store_name]
-                self._save_stores()
-                print(f"✅ Deleted virtual store: {store_name}")
-                return True
-            else:
-                print(f"⚠️  Store '{store_name}' not found")
-                return False
+            self.client.file_search_stores.delete(
+                name=store_name,
+                config={'force': force}
+            )
+            print(f"✅ Deleted File Search store: {store_name}")
+            return True
         except Exception as e:
             print(f"❌ Error deleting store '{store_name}': {e}")
             raise
@@ -116,19 +102,19 @@ class FileSearchClient:
         file_path: str, 
         store_name: str, 
         display_name: Optional[str] = None,
-        metadata: Optional[List[Dict[str, Any]]] = None
+        chunking_config: Optional[Dict[str, Any]] = None
     ) -> str:
         """
-        Upload a document to Google AI and track it in a virtual store.
+        Upload a document directly to a File Search store.
         
         Args:
             file_path: Path to the file to upload
-            store_name: Name of the target store
+            store_name: Full resource name of the target store
             display_name: Optional display name for the file
-            metadata: Optional metadata for the file
+            chunking_config: Optional chunking configuration
             
         Returns:
-            File name from Google AI
+            Operation name
         """
         try:
             file_path_obj = Path(file_path)
@@ -142,37 +128,30 @@ class FileSearchClient:
             
             print(f"🔄 Uploading {file_path_obj.name} ({file_size_mb:.1f}MB)...")
             
-            # Upload to Google AI
-            uploaded_file = genai.upload_file(
-                path=str(file_path_obj),
-                display_name=display_name or file_path_obj.name
+            # Prepare config
+            upload_config = {
+                'display_name': display_name or file_path_obj.name
+            }
+            
+            # Add chunking config if provided
+            if chunking_config:
+                upload_config['chunking_config'] = chunking_config
+            
+            # Upload directly to file search store
+            operation = self.client.file_search_stores.upload_to_file_search_store(
+                file=str(file_path_obj),
+                file_search_store_name=store_name,
+                config=upload_config
             )
             
-            # Wait for file to be processed
-            while uploaded_file.state.name == "PROCESSING":
+            # Wait for operation to complete
+            while not operation.done:
                 print("⏳ Processing upload...")
-                time.sleep(2)
-                uploaded_file = genai.get_file(uploaded_file.name)
-            
-            if uploaded_file.state.name != "ACTIVE":
-                raise Exception(f"Upload failed: {uploaded_file.state}")
-            
-            # Track file in virtual store
-            if store_name not in self.uploaded_files:
-                self.uploaded_files[store_name] = []
-            
-            file_info = {
-                'name': uploaded_file.name,
-                'display_name': uploaded_file.display_name,
-                'size_bytes': file_path_obj.stat().st_size,
-                'mime_type': uploaded_file.mime_type,
-                'metadata': metadata or {}
-            }
-            self.uploaded_files[store_name].append(file_info)
-            self._save_stores()
+                time.sleep(5)
+                operation = self.client.operations.get(operation)
             
             print(f"✅ Successfully uploaded: {file_path_obj.name}")
-            return uploaded_file.name
+            return operation.name
             
         except Exception as e:
             print(f"❌ Error uploading file '{file_path}': {e}")
@@ -189,11 +168,11 @@ class FileSearchClient:
         
         Args:
             url: URL of the document to upload
-            store_name: Name of the target store
+            store_name: Full resource name of the target store
             display_name: Optional display name for the file
             
         Returns:
-            Upload operation name
+            Operation name
         """
         try:
             try:
@@ -228,50 +207,64 @@ class FileSearchClient:
     
     def list_files_in_store(self, store_name: str) -> List[Dict[str, Any]]:
         """
-        List all files in a virtual store.
+        List all files/documents in a File Search store.
         
         Args:
-            store_name: Name of the store
+            store_name: Full resource name of the store
             
         Returns:
             List of file information dictionaries
         """
         try:
-            if store_name not in self.uploaded_files:
-                return []
-            return self.uploaded_files[store_name]
+            # The documents are accessed via the store
+            # Using file_search_stores documents list if available
+            files = []
+            # Note: The API may vary - adjust based on actual SDK capabilities
+            try:
+                for doc in self.client.file_search_stores.list_documents(name=store_name):
+                    files.append({
+                        'name': doc.name,
+                        'display_name': getattr(doc, 'display_name', doc.name),
+                        'size_bytes': getattr(doc, 'size_bytes', 0)
+                    })
+            except AttributeError:
+                # Fallback: the list_documents may not be available in all SDK versions
+                print("⚠️  Document listing not available in this SDK version")
+            return files
         except Exception as e:
             print(f"❌ Error listing files in store '{store_name}': {e}")
-            raise
+            return []
     
     def get_store_by_name(self, display_name: str) -> Optional[str]:
         """
-        Get store name by display name.
+        Get store resource name by display name.
         
         Args:
             display_name: Display name to search for
             
         Returns:
-            Store name if found, None otherwise
+            Store resource name if found, None otherwise
         """
         try:
-            if display_name in self.uploaded_files:
+            # If it already looks like a resource name, return it
+            if display_name.startswith('fileSearchStores/'):
                 return display_name
+            
+            # Search through stores
+            for store in self.client.file_search_stores.list():
+                store_display = getattr(store, 'display_name', '')
+                if store_display == display_name or store.name == display_name:
+                    return store.name
             return None
         except Exception as e:
             print(f"❌ Error searching for store '{display_name}': {e}")
             return None
     
-    def get_files_for_generation(self, store_name: str) -> List[str]:
+    def get_client(self) -> genai.Client:
         """
-        Get list of file names for use in content generation.
+        Get the underlying genai Client for advanced operations.
         
-        Args:
-            store_name: Name of the store
-            
         Returns:
-            List of file names
+            genai.Client instance
         """
-        if store_name not in self.uploaded_files:
-            return []
-        return [file_info['name'] for file_info in self.uploaded_files[store_name]]
+        return self.client

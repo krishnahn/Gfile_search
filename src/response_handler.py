@@ -1,8 +1,7 @@
 """
 Response handler for processing API responses and extracting citations.
 """
-from typing import List, Dict, Any, Optional, NamedTuple
-import json
+from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 
 @dataclass
@@ -100,9 +99,20 @@ class ResponseHandler:
             grounding = candidate.grounding_metadata
             
             # Extract file search grounding chunks
-            if hasattr(grounding, 'file_search_grounding') and grounding.file_search_grounding:
+            if hasattr(grounding, 'grounding_chunks') and grounding.grounding_chunks:
+                for chunk in grounding.grounding_chunks:
+                    citation = Citation(
+                        file_name=self._extract_file_name(chunk),
+                        chunk_text=self._extract_chunk_text(chunk),
+                        page_number=self._extract_page_number(chunk),
+                        score=self._extract_score(chunk),
+                        metadata=self._extract_chunk_metadata(chunk)
+                    )
+                    citations.append(citation)
+            
+            # Alternative: Check for file_search_grounding
+            elif hasattr(grounding, 'file_search_grounding') and grounding.file_search_grounding:
                 chunks = grounding.file_search_grounding.grounding_chunks
-                
                 for chunk in chunks:
                     citation = Citation(
                         file_name=self._extract_file_name(chunk),
@@ -144,14 +154,14 @@ class ResponseHandler:
             # Convert to dictionary for easier handling
             metadata = {
                 'support_score': getattr(grounding, 'support_score', None),
-                'file_search_grounding': None
+                'grounding_chunks_count': 0
             }
             
-            if hasattr(grounding, 'file_search_grounding') and grounding.file_search_grounding:
-                file_search = grounding.file_search_grounding
-                metadata['file_search_grounding'] = {
-                    'chunk_count': len(file_search.grounding_chunks) if file_search.grounding_chunks else 0
-                }
+            if hasattr(grounding, 'grounding_chunks') and grounding.grounding_chunks:
+                metadata['grounding_chunks_count'] = len(grounding.grounding_chunks)
+            elif hasattr(grounding, 'file_search_grounding') and grounding.file_search_grounding:
+                if hasattr(grounding.file_search_grounding, 'grounding_chunks'):
+                    metadata['grounding_chunks_count'] = len(grounding.file_search_grounding.grounding_chunks)
             
             return metadata
             
@@ -159,41 +169,19 @@ class ResponseHandler:
             print(f"⚠️  Error extracting grounding metadata: {e}")
             return None
     
-    def format_response(self, search_response: SearchResponse, include_citations: bool = True) -> str:
+    def format_response(self, search_response: SearchResponse, include_citations: bool = False) -> str:
         """
         Format a SearchResponse into readable text.
         
         Args:
             search_response: SearchResponse to format
-            include_citations: Whether to include citation information
+            include_citations: Whether to include citation information (default: False)
             
         Returns:
-            Formatted response string
+            Formatted response string - only the answer without sources
         """
-        formatted = f"**Answer:**\n{search_response.answer}\n"
-        
-        if include_citations and search_response.citations:
-            formatted += f"\n**Sources ({len(search_response.citations)} found):**\n"
-            
-            for i, citation in enumerate(search_response.citations, 1):
-                formatted += f"{i}. **{citation.file_name}**"
-                
-                if citation.page_number:
-                    formatted += f" (Page {citation.page_number})"
-                
-                if citation.score:
-                    formatted += f" (Relevance: {citation.score:.2f})"
-                
-                formatted += "\n"
-                
-                if citation.chunk_text:
-                    # Truncate long chunks
-                    chunk = citation.chunk_text[:200] + "..." if len(citation.chunk_text) > 200 else citation.chunk_text
-                    formatted += f"   _{chunk}_\n"
-                
-                formatted += "\n"
-        
-        return formatted
+        # Return only the answer without any sources
+        return f"**Answer:**\n{search_response.answer}\n"
     
     def format_citations_only(self, citations: List[Citation]) -> str:
         """
@@ -227,6 +215,12 @@ class ResponseHandler:
                 return chunk.file_name
             elif hasattr(chunk, 'source') and hasattr(chunk.source, 'file_name'):
                 return chunk.source.file_name
+            elif hasattr(chunk, 'retrieved_context'):
+                ctx = chunk.retrieved_context
+                if hasattr(ctx, 'uri'):
+                    return ctx.uri.split('/')[-1]
+                if hasattr(ctx, 'title'):
+                    return ctx.title
             return "Unknown File"
         except:
             return "Unknown File"
@@ -238,6 +232,8 @@ class ResponseHandler:
                 return chunk.chunk_text
             elif hasattr(chunk, 'content'):
                 return chunk.content
+            elif hasattr(chunk, 'retrieved_context') and hasattr(chunk.retrieved_context, 'text'):
+                return chunk.retrieved_context.text
             return ""
         except:
             return ""
@@ -280,7 +276,7 @@ class ResponseHandler:
         unique_citations = []
         
         for citation in citations:
-            key = (citation.file_name, citation.chunk_text[:100])  # Use first 100 chars for dedup
+            key = (citation.file_name, citation.chunk_text[:100] if citation.chunk_text else "")
             if key not in seen:
                 seen.add(key)
                 unique_citations.append(citation)

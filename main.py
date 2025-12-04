@@ -36,7 +36,8 @@ class RAGSystemCLI:
         """Create a new File Search store."""
         try:
             store_id = self.client.create_store(store_name)
-            print(f"✅ Created store '{store_name}' with ID: {store_id}")
+            print(f"✅ Created store '{store_name}'")
+            print(f"   Use this ID for future operations: {store_id}")
             return True
         except Exception as e:
             print(f"❌ Failed to create store: {e}")
@@ -47,36 +48,29 @@ class RAGSystemCLI:
         try:
             stores = self.client.list_stores()
             if not stores:
-                print("No stores found.")
+                print("No stores found. Create one with 'create-store <name>'")
                 return
             
             print(f"📂 Found {len(stores)} stores:")
             for store in stores:
-                print(f"  - {store['display_name']} (ID: {store['name']})")
-                files = self.client.list_files_in_store(store['name'])
-                print(f"    Files: {len(files)}")
+                print(f"  - {store['display_name']}")
+                print(f"    ID: {store['name']}")
         except Exception as e:
             print(f"❌ Error listing stores: {e}")
     
-    def upload_file(self, file_path: str, store_name: str, doc_type: Optional[str] = None):
+    def upload_file(self, file_path: str, store_name: str):
         """Upload a single file to a store."""
         try:
-            # Check if store exists by display name or ID
+            # Resolve store name to resource ID
             store_id = self.client.get_store_by_name(store_name)
             if not store_id:
-                # Try using it as direct store ID
-                stores = self.client.list_stores()
-                if not any(s['name'] == store_name for s in stores):
-                    print(f"❌ Store '{store_name}' not found. Available stores:")
-                    for store in stores:
-                        print(f"  - {store['display_name']}")
-                    return False
-                store_id = store_name
+                print(f"❌ Store '{store_name}' not found. Available stores:")
+                self.list_stores()
+                return False
             
-            operation = self.doc_processor.upload_document(
+            self.doc_processor.upload_document(
                 file_path=file_path,
-                store_name=store_id,
-                document_type=doc_type or "document"
+                store_name=store_id
             )
             print(f"✅ Uploaded '{file_path}' to store '{store_name}'")
             return True
@@ -89,11 +83,8 @@ class RAGSystemCLI:
         try:
             store_id = self.client.get_store_by_name(store_name)
             if not store_id:
-                stores = self.client.list_stores()
-                if not any(s['name'] == store_name for s in stores):
-                    print(f"❌ Store '{store_name}' not found")
-                    return False
-                store_id = store_name
+                print(f"❌ Store '{store_name}' not found")
+                return False
             
             operations = self.doc_processor.upload_directory(
                 directory_path=dir_path,
@@ -109,18 +100,10 @@ class RAGSystemCLI:
     def search(self, query: str, store_name: str, format_output: bool = True):
         """Perform a search query."""
         try:
-            store_id = self.client.get_store_by_name(store_name)
-            if not store_id:
-                stores = self.client.list_stores()
-                if not any(s['name'] == store_name for s in stores):
-                    print(f"❌ Store '{store_name}' not found")
-                    return None
-                store_id = store_name
-            
             print(f"🔍 Searching in '{store_name}' for: {query}")
             response = self.search_manager.search_and_generate(
                 query=query,
-                store_name=store_id
+                store_name=store_name
             )
             
             if format_output:
@@ -129,8 +112,6 @@ class RAGSystemCLI:
                 print(formatted)
             else:
                 print(f"\nAnswer: {response.answer}")
-                if response.citations:
-                    print(f"Sources: {len(response.citations)} found")
             
             return response
         except Exception as e:
@@ -140,23 +121,14 @@ class RAGSystemCLI:
     def ask_question(self, question: str, store_name: str):
         """Ask a direct question."""
         try:
-            store_id = self.client.get_store_by_name(store_name)
-            if not store_id:
-                store_id = store_name
-            
             response = self.search_manager.ask_question(
                 question=question,
-                store_name=store_id
+                store_name=store_name
             )
             
             print("\n" + "="*50)
             print(f"Question: {question}")
             print(f"Answer: {response.answer}")
-            
-            if response.citations:
-                print(f"\nSources ({len(response.citations)}):")
-                for i, citation in enumerate(response.citations, 1):
-                    print(f"  {i}. {citation.file_name}")
             
             return response
         except Exception as e:
@@ -166,12 +138,8 @@ class RAGSystemCLI:
     def summarize(self, store_name: str, focus_topic: Optional[str] = None):
         """Generate a summary of documents in a store."""
         try:
-            store_id = self.client.get_store_by_name(store_name)
-            if not store_id:
-                store_id = store_name
-            
             response = self.search_manager.summarize_documents(
-                store_name=store_id,
+                store_name=store_name,
                 focus_topic=focus_topic
             )
             
@@ -191,6 +159,21 @@ class RAGSystemCLI:
         except Exception as e:
             print(f"❌ Summarization failed: {e}")
             return None
+    
+    def delete_store(self, store_name: str):
+        """Delete a File Search store."""
+        try:
+            store_id = self.client.get_store_by_name(store_name)
+            if not store_id:
+                print(f"❌ Store '{store_name}' not found")
+                return False
+            
+            self.client.delete_store(store_id)
+            print(f"✅ Deleted store '{store_name}'")
+            return True
+        except Exception as e:
+            print(f"❌ Failed to delete store: {e}")
+            return False
     
     def interactive_mode(self, store_name: str):
         """Start interactive Q&A session."""
@@ -215,21 +198,11 @@ Available commands:
   • Any question or query - Get AI-powered answer with citations
   • 'summarize' - Generate document summary
   • 'summarize [topic]' - Generate focused summary
-  • 'files' - List files in current store
   • 'stores' - List all available stores
   • 'switch [store]' - Switch to different store
   • 'help' - Show this help
   • 'quit' - Exit interactive mode
 """)
-                    continue
-                
-                if query.lower() == 'files':
-                    store_id = self.client.get_store_by_name(store_name) or store_name
-                    files = self.client.list_files_in_store(store_id)
-                    print(f"\n📁 Files in '{store_name}' ({len(files)}):")
-                    for file_info in files:
-                        size_mb = file_info['size_bytes'] / (1024 * 1024)
-                        print(f"  - {file_info['display_name']} ({size_mb:.1f} MB)")
                     continue
                 
                 if query.lower() == 'stores':
@@ -288,6 +261,9 @@ Examples:
 
   # List all stores
   python main.py list-stores
+
+  # Delete a store
+  python main.py delete-store my-docs
 """
     )
     
@@ -314,6 +290,12 @@ Examples:
         
         elif args.command == 'list-stores':
             cli.list_stores()
+        
+        elif args.command == 'delete-store':
+            if not args.args:
+                print("❌ Store name required")
+                return
+            cli.delete_store(args.args[0])
         
         elif args.command == 'upload':
             if len(args.args) < 2:
